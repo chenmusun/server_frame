@@ -1,0 +1,7 @@
+#ifndef THREAD_POOL_METHOD_IMP_H_
+#define THREAD_POOL_METHOD_IMP_H_
+class ThreadPoolMethodImp{
+public:
+        virtual void operator()(void * arg)=0;
+};
+#endif

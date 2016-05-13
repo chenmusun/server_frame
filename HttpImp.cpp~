@@ -1,0 +1,6 @@
+#include "HttpImp.h"
+
+void HttpImp::operator()(void *arg)
+{
+
+}

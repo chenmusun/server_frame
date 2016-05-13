@@ -1,0 +1,10 @@
+此服务器框架采用one loop per thread + threadpool模式，threadpool用于数据计算；
+当需要对数据进行自定义处理时，只需要ThreadPoolMethodImp派生出子类，并覆盖()函数，如：
+class HttpImp:public ThreadPoolMethodImp{
+public:
+        HttpImp();
+        ~HttpImp();
+        void operator()(void * arg,size_t length);
+        int fd_;
+};
+这一模式被称为桥接模式。

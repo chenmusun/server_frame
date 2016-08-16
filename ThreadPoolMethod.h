@@ -1,19 +1,22 @@
 #ifndef THREAD_POOL_METHOD_H_
 #define THREAD_POOL_METHOD_H_
-#include "ThreadPoolMethodImplementor.h"
-#include "nedmalloc.h"
+/* #include "nedmalloc.h" */
+/* #include "tcpudpconnitem.h" */
+#include "threadpoolfunctions.h"
+/* typedef void (*DataHandleProc)(TcpConnItemData); */
+
 class ThreadPoolMethod{
 public:
-        ThreadPoolMethod(ThreadPoolMethodImp * imp){
-                imp_=imp;
+        ThreadPoolMethod(DataHandleProc proc){
+                proc_=proc;
         }
-        void operator()(void * arg,size_t length)
+        void operator()(TcpConnItemData arg)//此处只能用拷贝，不能用引用
         {
-                (*imp_)(arg,length);
+                proc_(arg);
                 //回收内存
-                nedalloc::nedfree(arg);
+                nedalloc::nedfree(arg.data);
         }
 private:
-        ThreadPoolMethodImp * imp_;
+        DataHandleProc proc_;
 };
 #endif

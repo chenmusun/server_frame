@@ -8,7 +8,7 @@
 #include<boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 // #include<stdio.h>
-#include "HttpImp.h"
+// #include "HttpImp.h"
 namespace pt = boost::property_tree;//
 INITIALIZE_EASYLOGGINGPP//初始化日志记录库
 
@@ -20,14 +20,16 @@ int main(int argc, char* argv[])
     pt::read_xml("./libevent_server.xml", tree);
 
     int tcp_port=tree.get("server.tcpport",5678);
+    int sms_tcp_port=tree.get("server.tcpsmsport",6789);
+    int ter_tcp_port=tree.get("server.tcpterport",7890);
     int udp_port=tree.get("server.udpport",1234);
     int num_of_threads=tree.get("server.threadnum",4);
     int timespan=tree.get("server.timespan",2);
     int overtime=tree.get("server.overtime",20);
     int threadpool=tree.get("server.threadpool",12);
-    HttpImp httpimp;//数据处理类
-    ThreadPoolMethod method(&httpimp);
-    LibeventServer ls(tcp_port,udp_port,num_of_threads,overtime,timespan,threadpool,&method);
+
+    // ThreadPoolMethod method(&httpimp);
+    LibeventServer ls(tcp_port,sms_tcp_port,ter_tcp_port,udp_port,num_of_threads,overtime,timespan,threadpool);
     if(!ls.RunService())
     {
         LOG(ERROR)<<"LibeventServer fails to start service"<<std::endl;

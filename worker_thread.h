@@ -6,57 +6,22 @@
  */
 #ifndef WORKER_THREAD_H_
 #define WORKER_THREAD_H_
-#include<event2/util.h>
-#include<event2/event.h>
-#include<event2/bufferevent.h>
-#include<thread>
-#include<memory>
-#include<map>
-#include<mutex>
-#include <fcntl.h>
-#include<unistd.h>
-#include<event2/buffer.h>
-#include<queue>
-//增加日志功能
-#define ELPP_THREAD_SAFE
-#include"easylogging++.h"
-/* #include "http_parser.h" */
-#include "ThreadPool.h"
-#include "ThreadPoolMethod.h"
-#include "nedmalloc.h"
+
+#include"tcpudpconnitem.h"
 /* class WorkerThread; */
 /* extern thread_local WorkerThread *pthread_info; */
-
-struct TcpConnItem{
-	TcpConnItem(int sock){
-		tcp_sock_=sock;
-		/* pthread_info_belongs_=pti; */
-	}
-	int tcp_sock_;
-	//TODO add a tcp log for test
-	int tcp_log_fd_;
-};
-struct UdpConnItem{
-	UdpConnItem(int sock){
-		udp_sock_=sock;
-		pudp_read_event_=NULL;
-		LOG(TRACE)<<"UdpConnItem";
-	}
-	~UdpConnItem(){
-		LOG(TRACE)<<"~UdpConnItem";
-		if(pudp_read_event_)
-			event_free(pudp_read_event_);
-	}
-	int udp_sock_;
-	struct event * pudp_read_event_;
-};
-
+class LibeventServer;
 class WorkerThread
 {
 public:
-	WorkerThread(int tm,int tm_threshold);
+	/* WorkerThread(int tm,int tm_threshold,LibeventServer * ls); */
+	WorkerThread(LibeventServer * ls);
 	~WorkerThread();
 	bool Run();//运行工作线程
+	//send data handle
+	static void	SendDataToClient(WorkerThread * pwt);
+	//kill tcp connection
+	static void KillTcpConnection(WorkerThread * pwt);
 	//TCP 处理
 	static void HandleTcpConn(WorkerThread* pwt);
 	static void TcpConnReadCb(bufferevent * bev,void *ctx);
@@ -71,11 +36,21 @@ public:
 	static void HandleConn(evutil_socket_t fd, short what, void * arg);
 	//线程缓存数据处理
 	void AddTcpConnItem(std::shared_ptr<TcpConnItem> tci){
-		map_tcp_conns_.insert(std::make_pair(tci->tcp_sock_,tci));
+		map_tcp_conns_.insert(std::make_pair(tci->sessionid,tci));
 	}
 
-	void DeleteTcpConnItem(int tcp_sock){
-		map_tcp_conns_.erase(tcp_sock);
+	std::shared_ptr<TcpConnItem> FindTcpConnItem(unsigned int sessionid)
+	{
+		auto pos=map_tcp_conns_.find(sessionid);
+		if(pos!=map_tcp_conns_.end())
+			return pos->second;
+		else {
+			return std::shared_ptr<TcpConnItem>();
+		}
+	}
+
+	void DeleteTcpConnItem(unsigned int sessionid){
+		map_tcp_conns_.erase(sessionid);
 		/* delete tci; */
 	}
 
@@ -89,16 +64,16 @@ public:
 		/* delete uci; */
 	}
 
-	void PushTcpIntoQueue(int sock){
+	void PushTcpIntoQueue(std::shared_ptr<TcpConnItem> tcpconn){
 		std::lock_guard<std::mutex>  lock(mutex_tcp_queue_);
-		queue_tcp_socks_.push(sock);
+		queue_tcp_conns_.push(tcpconn);
 	}
 
-	int PopTcpFromQueue()
+	std::shared_ptr<TcpConnItem> PopTcpFromQueue()
 	{
 		std::lock_guard<std::mutex>  lock(mutex_tcp_queue_);
-		int ret=queue_tcp_socks_.front();
-		queue_tcp_socks_.pop();
+		std::shared_ptr<TcpConnItem> ret=queue_tcp_conns_.front();
+		queue_tcp_conns_.pop();
 		return ret;
 	}
 
@@ -113,20 +88,60 @@ public:
 		queue_udp_addrs_.pop();
 	}
 
-	bool NotifyWorkerThread(const char* pchar)//由LibeventServer调用
+	bool NotifyWorkerThread(const char* pchar)
 	{
+		std::lock_guard<std::mutex> lock(mutex_notify_send_fd_);
 		if(write(notfiy_send_fd_,pchar, 1)!=1)
 			return false;
 		return true;
 	}
 
-	void SetThreadPool(std::shared_ptr<ThreadPool> thread_pool){
-		thread_pool_=thread_pool;
+	/* void SetThreadPool(std::shared_ptr<ThreadPool> thread_pool){ */
+	/* 	thread_pool_=thread_pool; */
+	/* } */
+
+	/* void SetThreadPoolMethod(std::shared_ptr<ThreadPoolMethod> method) */
+	/* { */
+	/* 	thread_pool_method_=method; */
+	/* } */
+
+	void CloseTcpConn(unsigned int sessionid)//actively close the connection
+	{
+		auto pos=map_tcp_conns_.find(sessionid);
+		if(pos!=map_tcp_conns_.end())
+		{
+			/* pthread_info->DeleteTcpConnItem(ptci->tcp_sock_); */
+			bufferevent_free(pos->second->bev);
+			map_tcp_conns_.erase(pos);
+		}
 	}
 
-	void SetThreadPoolMethod(std::shared_ptr<ThreadPoolMethod> method)
+	void PushResultIntoQueue(TcpConnItemData& result)
 	{
-		thread_pool_method_=method;
+		std::lock_guard<std::mutex> lock(mutex_queue_result_);
+		queue_result_.push(result);
+	}
+
+	TcpConnItemData PopResultFromQueue()
+	{
+		std::lock_guard<std::mutex>  lock(mutex_queue_result_);
+		TcpConnItemData ret=queue_result_.front();
+		queue_result_.pop();
+		return ret;
+	}
+
+	void PushKillIntoQueue(unsigned int sessionid)
+	{
+		std::lock_guard<std::mutex> lock(mutex_queue_kill_);
+		queue_kill_.push(sessionid);
+	}
+
+	unsigned int PopKillFromQueue()
+	{
+		std::lock_guard<std::mutex>  lock(mutex_queue_kill_);
+		unsigned int ret=queue_kill_.front();
+		queue_kill_.pop();
+		return ret;
 	}
 private:
 	bool CreateNotifyFds();//创建主线程和工作线程通信管道
@@ -134,22 +149,29 @@ private:
 public:
 	evutil_socket_t  notfiy_recv_fd_;//工作线程接收端
 	evutil_socket_t  notfiy_send_fd_;//监听线程发送端
+	std::mutex mutex_notify_send_fd_;
+	std::mutex mutex_queue_result_;
+	std::queue<TcpConnItemData> queue_result_;
+	std::mutex mutex_queue_kill_;
+	std::queue<unsigned int> queue_kill_;
 	std::shared_ptr<std::thread>   shared_ptr_thread_;
-	std::map<int,std::shared_ptr<TcpConnItem> > map_tcp_conns_;
+	std::unordered_map<unsigned int,std::shared_ptr<TcpConnItem> > map_tcp_conns_;
 	std::map<int,std::shared_ptr<UdpConnItem> > map_udp_conns_;
 	std::mutex mutex_tcp_queue_;
-	std::queue<int> queue_tcp_socks_;
+	std::queue<std::shared_ptr<TcpConnItem> > queue_tcp_conns_;
 	std::mutex mutex_udp_queue_;
 	std::queue<sockaddr_in> queue_udp_addrs_;
-	std::shared_ptr<ThreadPool> thread_pool_;
-	std::shared_ptr<ThreadPoolMethod> thread_pool_method_;
+	/* std::shared_ptr<ThreadPool> thread_pool_; */
+	/* std::shared_ptr<ThreadPoolMethod> thread_pool_method_; */
+	LibeventServer * ls_;
 private:
 	struct event  * pnotify_event_; //主线程通知工作线程连接到来事件
 	/* DataHandleProc handle_data_proc_;//数据处理回调函数 */
 	struct event_base * pthread_event_base_;
 	struct event * ptimeout_event_;
-	int overtime_threshold_;
-	int timespan_;
+	/* int overtime_threshold_; */
+	/* int timespan_; */
+
 };
 #endif
 

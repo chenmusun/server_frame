@@ -1,0 +1,47 @@
+#include"threadpoolfunctions.h"
+#include"libevent_server.h"
+
+void DxpUpload(TcpConnItemData data)
+{
+        BinCodes codes;
+        codes.bincodes=(uint8_t *)data.data;
+        codes.length=data.length;
+
+        IotPacketWithStatus *packet=TransformBinCodesToIotPacket(&codes);
+        //write to file
+        if(packet)
+        {
+                if(!packet->statuscode)
+                {
+                        //验证合法性 合法继续后续操作，不合法断开连接
+
+                        //保存IMEI号和tcp连接的映射关系
+                        WorkerThread * pthreadinfo=data.tcpconnitemptr.lock()->pthreadinfo;
+                        pthreadinfo->ls_->InsertImeiThreadIntoMap((const char *)packet->packet->IMEI,data.tcpconnitemptr);
+
+                        //test 返回结果
+                        // std::shared_ptr<DataToThread> ret(new DataToThread());
+                        // DataToThread ret(data.data,data.sessionid,data.length);
+
+                        // pthreadinfo->PushResultIntoQueue(std::shared_ptr result);
+                        // pthreadinfo->NotifyWorkerThread('r');
+
+                        //向REDIS注册，失败写log
+
+                        //向kafka写消息
+                }
+                else {
+                        LOG(WARNING)<<"Decode failed and error num is "<<packet->statuscode;
+                }
+                FreeIotPacketOnHeap(packet);
+        }
+}
+
+
+
+
+
+void DxpDownload(TcpConnItemData data)
+{
+
+}

@@ -6,8 +6,10 @@
  */
 #include "libevent_server.h"
 
+thread_local int thread_local_port=-1;
 
-LibeventServer::LibeventServer(int tcp_port,int udp_port,int num_of_threads,int overtime,int timespan,int threadpool,ThreadPoolMethod * method)
+// LibeventServer::LibeventServer(int tcp_port,int udp_port,int num_of_threads,int overtime,int timespan,int threadpool,ThreadPoolMethod * method)
+LibeventServer::LibeventServer(int tcp_port,int sms_port,int status_port,int udp_port,int num_of_threads,int overtime,int timespan,int threadpool)
 {
     tcp_listen_base_=NULL;
     tcp_conn_listenner_=NULL;
@@ -15,7 +17,13 @@ LibeventServer::LibeventServer(int tcp_port,int udp_port,int num_of_threads,int 
     udp_conn_event_=NULL;
     overtime_event_=NULL;
     overtime_check_base_=NULL;
+    tcp_sms_listen_base_=NULL;
+    tcp_sms_conn_listenner_=NULL;
+    tcp_status_query_listen_base_=NULL;
+    tcp_status_query_conn_listenner_=NULL;
     tcp_listen_port_=tcp_port;
+    tcp_sms_listen_port_=sms_port;
+    tcp_status_query_listen_port_=status_port;
     udp_listen_port_=udp_port;
     num_of_workers_=num_of_threads;
     overtime_threshold_=overtime;
@@ -23,7 +31,7 @@ LibeventServer::LibeventServer(int tcp_port,int udp_port,int num_of_threads,int 
     timespan_=timespan;
     last_thread_index_=-1;
     thread_pool_num_=threadpool;
-    thread_pool_method_.reset(method);
+    session_id_=0;
 }
 LibeventServer::~LibeventServer()
 {
@@ -41,15 +49,29 @@ LibeventServer::~LibeventServer()
         event_free(overtime_event_);
     if(udp_listen_socket_!=-1)
         close(udp_listen_socket_);
+    if(tcp_sms_listen_base_)
+        event_base_free(tcp_sms_listen_base_);
+    if(tcp_sms_conn_listenner_)
+        evconnlistener_free(tcp_sms_conn_listenner_);
+    if(tcp_status_query_listen_base_)
+        event_base_free(tcp_status_query_listen_base_);
+    if(tcp_status_query_conn_listenner_)
+        evconnlistener_free(tcp_status_query_conn_listenner_);
 }
-
+//int port,event_base ** base,evconnlistener ** listener,evconnlistener_cb TcpConnCb,evconnlistener_cb TcpErrCb,std::shared_ptr<std::thread> * thread
 bool LibeventServer::RunService()
 {
 	do
     {
+        if(!InitThreadPoolMethods())
+            break;
         if(!CreateWorkerThreads())
             break;
-        if(!StartTcpListen())
+        if(!StartTcpListen(tcp_listen_port_,&tcp_listen_base_,&tcp_conn_listenner_,AcceptTcpConn,AcceptTcpError,&tcp_listen_thread_))
+            break;
+        if(!StartTcpListen(tcp_sms_listen_port_,&tcp_sms_listen_base_,&tcp_sms_conn_listenner_,AcceptTcpConn,AcceptTcpError,&tcp_sms_listen_thread_))
+            break;
+        if(!StartTcpListen(tcp_status_query_listen_port_,&tcp_status_query_listen_base_,&tcp_status_query_conn_listenner_,AcceptTcpConn,AcceptTcpError,&tcp_status_query_listen_thread_))
             break;
         if(!StartUdpListen())
             break;
@@ -58,9 +80,16 @@ bool LibeventServer::RunService()
 	return false;
 }
 
+bool LibeventServer::StartMQMessageListen()
+{
+    return true;
+}
+
 void LibeventServer::WaitForListenThread()
 {
         tcp_listen_thread_->join();
+        tcp_sms_listen_thread_->join();
+        tcp_status_query_listen_thread_->join();
         udp_listen_thread_->join();
         // overtime_check_thread_->join();
 }
@@ -74,15 +103,41 @@ void LibeventServer::AcceptTcpError(evconnlistener *listener, void *ptr)
 
 void LibeventServer::AcceptTcpConn(evconnlistener * listener, int sock, sockaddr * addr, int len, void *ptr)
 {
-  LOG(TRACE)<<"Accept Tcp Conn,Send it to worker";
   LibeventServer * pls=static_cast<LibeventServer *>(ptr);
-  int cur_thread_index = (pls->last_thread_index_ + 1) %pls->num_of_workers_; // 轮循选择工作线程
-  pls->last_thread_index_ = cur_thread_index;
-  pls->worker_thread_vec_[cur_thread_index]->PushTcpIntoQueue(sock);//准备好数据然后通知
+  int cur_thread_index=0;
+  unsigned int sessionid=0;
+  {
+      std::lock_guard<std::mutex>  lock(pls->mutex_thread_index_sessionid_);
+      cur_thread_index = (pls->last_thread_index_ + 1) %pls->num_of_workers_; // 轮循选择工作线程
+      pls->last_thread_index_ = cur_thread_index;
+      sessionid=pls->session_id_++;
+  }
+  std::shared_ptr<TcpConnItem> ptci(new TcpConnItem(sock,sessionid,pls->worker_thread_vec_[cur_thread_index].get()));
+  if(!ptci)
+      return;
+
+  if(pls->tcp_listen_port_==thread_local_port)
+  {
+      ptci->SetPacketType(TCPDEVICE);
+  }
+  else if(pls->tcp_sms_listen_port_==thread_local_port)
+  {
+      ptci->SetPacketType(TCPSMS);
+  }
+  else if(pls->tcp_status_query_listen_port_==thread_local_port){
+      ptci->SetPacketType(TCPTERMINAL);
+ }
+  else{
+
+  }
+
+  pls->worker_thread_vec_[cur_thread_index]->PushTcpIntoQueue(ptci);//准备好数据然后通知
+
   if(!pls->worker_thread_vec_[cur_thread_index]->NotifyWorkerThread("t")){
-      LOG(ERROR)<<"tcp notify worker failed";
+      LOG(WARNING)<<"tcp notify worker failed";
       pls->worker_thread_vec_[cur_thread_index]->PopTcpFromQueue();
   }
+
 
 }
 
@@ -113,14 +168,15 @@ bool LibeventServer::CreateWorkerThreads()
     try {
         thread_pool_.reset(new ThreadPool(thread_pool_num_));
         for(int i=0;i<num_of_workers_;++i){
-            std::shared_ptr<WorkerThread> pti(new WorkerThread(timespan_,overtime_threshold_));
+            // std::shared_ptr<WorkerThread> pti(new WorkerThread(timespan_,overtime_threshold_));
+            std::shared_ptr<WorkerThread> pti(new WorkerThread(this));
             if(!pti->Run())
             {
                 ret=false;
                 break;
             }
-            pti->SetThreadPool(thread_pool_);//设置线程池
-            pti->SetThreadPoolMethod(thread_pool_method_);//设置线程池方法
+            // pti->SetThreadPool(thread_pool_);//设置线程池
+            // pti->SetThreadPoolMethod(thread_pool_method_);//设置线程池方法
             worker_thread_vec_.push_back(pti);
         }
     } catch (...) {
@@ -130,29 +186,30 @@ bool LibeventServer::CreateWorkerThreads()
     return ret;
 }
 
-bool LibeventServer::StartTcpListen()
+bool LibeventServer::StartTcpListen(int port,event_base ** base,evconnlistener ** listener,evconnlistener_cb TcpConnCb,evconnlistener_errorcb TcpErrCb,std::shared_ptr<std::thread> * thread)
 {
 	do{
         struct sockaddr_in sin;
-        tcp_listen_base_ = event_base_new();
-        if (!tcp_listen_base_)
+        *base = event_base_new();
+        if (!*base)
             break;
         memset(&sin, 0, sizeof(sin));
         sin.sin_family = AF_INET;
         sin.sin_addr.s_addr = htonl(0);
-        sin.sin_port = htons(tcp_listen_port_);
+        sin.sin_port = htons(port);
 
-        tcp_conn_listenner_ = evconnlistener_new_bind(tcp_listen_base_, AcceptTcpConn, this,
+        *listener = evconnlistener_new_bind(*base, TcpConnCb, this,
                                                       LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE, -1,
                                                       (struct sockaddr*)&sin, sizeof(sin));
-        if (!tcp_conn_listenner_)
+        if (!*listener)
             break;
-        evconnlistener_set_error_cb(tcp_conn_listenner_, AcceptTcpError);
+        evconnlistener_set_error_cb(*listener, TcpErrCb);
 
         try{
-            tcp_listen_thread_.reset(new std::thread([this]
+            (*thread).reset(new std::thread([this,port,base]
                                                      {
-                                                         event_base_dispatch(tcp_listen_base_);
+                                                         thread_local_port=port;
+                                                         event_base_dispatch(*base);
                                                      }
                                          ));
         }catch(...){
@@ -236,4 +293,23 @@ bool LibeventServer::StartOvertimeCheck()
 }
 void LibeventServer::TimingProcessing(evutil_socket_t fd, short what, void * arg)
 {
+}
+
+bool LibeventServer::InitThreadPoolMethods()
+{
+    try
+    {
+        for(int i=0;i<sizeof(threadpoolfunctions)/sizeof(KeyProc);++i)
+        {
+            auto keyproc=threadpoolfunctions[i];
+            std::shared_ptr<ThreadPoolMethod> method(new ThreadPoolMethod(keyproc.proc));
+            map_thread_pool_method_.insert(std::make_pair(keyproc.key,method));
+
+        }
+        return true;
+    }
+    catch(...)
+    {
+        return false;
+    }
 }

@@ -4,19 +4,22 @@
  *  Created on: 2016年4月12日
  *      Author: chenms
  */
+#include "libevent_server.h"
 #include "worker_thread.h"
 
  thread_local WorkerThread *pthread_info=NULL;
 
-WorkerThread::WorkerThread(int tm,int tm_threshold)
+// WorkerThread::WorkerThread(int tm,int tm_threshold,LibeventServer * ls)
+WorkerThread::WorkerThread(LibeventServer * ls)
 {
 	pthread_event_base_=NULL;
 	pnotify_event_=NULL;
 	ptimeout_event_=NULL;
 	notfiy_recv_fd_=-1;
 	notfiy_send_fd_=-1;
-	overtime_threshold_=tm_threshold;
-    timespan_=tm;
+    // overtime_threshold_=tm_threshold;
+    // timespan_=tm;
+    ls_=ls;
 }
 
 WorkerThread::~WorkerThread()
@@ -85,10 +88,11 @@ bool WorkerThread::InitEventHandler()
 				break;
 			if(event_add(pnotify_event_, 0))
 				break;
-			ptimeout_event_=event_new(pthread_event_base_,-1,EV_TIMEOUT|EV_PERSIST,TimingProcessing,&overtime_threshold_);
-			if(!ptimeout_event_)
+            // ptimeout_event_=event_new(pthread_event_base_,-1,EV_TIMEOUT|EV_PERSIST,TimingProcessing,&overtime_threshold_);
+            ptimeout_event_=event_new(pthread_event_base_,-1,EV_TIMEOUT|EV_PERSIST,TimingProcessing,&ls_->overtime_threshold_);
+            if(!ptimeout_event_)
 				break;
-			timeval tv={timespan_,0};
+            timeval tv={ls_->timespan_,0};
 			if(event_add(ptimeout_event_,&tv)==-1)
 				break;
 			return true;
@@ -106,6 +110,13 @@ void WorkerThread::HandleConn(evutil_socket_t fd, short what, void* arg)
         HandleTcpConn(pwt);
     else if(buf[0]=='u')
         HandleUdpConn(pwt);
+    else if(buf[0]=='r')
+    {
+        SendDataToClient(pwt);
+    }
+    else if(buf[0]=='k'){
+            KillTcpConnection(pwt);
+    }
     else{
         LOG(ERROR)<<"unkonwn protocol type";
     }
@@ -114,40 +125,91 @@ void WorkerThread::HandleConn(evutil_socket_t fd, short what, void* arg)
 
 void WorkerThread::HandleTcpConn(WorkerThread* pwt)
 {
-	LOG(TRACE)<<"Worker got the tcp conn";
-    int accept_sock=pwt->PopTcpFromQueue();
-    std::shared_ptr<TcpConnItem> ptci(new TcpConnItem(accept_sock));//将其地址存起来
-    // int log_fd=open("./test.log",O_RDWR|O_CREAT|O_APPEND,S_IRWXU);
-    // if(log_fd!=-1)
-    //     ptci->tcp_log_fd_=log_fd;
-	struct bufferevent * bev=bufferevent_socket_new(pwt->pthread_event_base_,ptci->tcp_sock_,BEV_OPT_CLOSE_ON_FREE);
+    std::shared_ptr<TcpConnItem> ptci=pwt->PopTcpFromQueue();
+    struct bufferevent * bev=bufferevent_socket_new(pwt->pthread_event_base_,ptci->tcp_sock_,BEV_OPT_CLOSE_ON_FREE);
 	if(bev==NULL)
 		return;
-	//将链接信息加入缓存中
+    //将链接信息加入缓存中
+    ptci->SetBuffer(bev);
     pwt->AddTcpConnItem(ptci);
-    bufferevent_setcb(bev, TcpConnReadCb, NULL/*ConnWriteCb*/, TcpConnEventCB,ptci.get()/*arg*/);
+    bufferevent_setcb(bev, TcpConnReadCb, NULL/*ConnWriteCb*/, TcpConnEventCB,&ptci->sessionid/*arg*/);
     bufferevent_enable(bev, EV_READ /*| EV_WRITE*/ );
 }
 
-static void TestThreadPool(void *arg)//TODO
-{
-}
 
 void WorkerThread::TcpConnReadCb(bufferevent * bev,void *ctx){
-    //TODO
-    LOG(TRACE)<<"Read a Tcp data";
-    TcpConnItem* ptci=static_cast<TcpConnItem *>(ctx);
-     //char buf[65535]={0};
-    // bufferevent_read(bev,buf,65535);
-     //bufferevent_write(bev,buf,65535);
-     // sleep(30);
-    // LOG(ERROR)<<buf;
-     struct evbuffer * in=bufferevent_get_input(bev);
-     size_t length=evbuffer_get_length(in);
-     void * ptcpdata=nedalloc::nedmalloc(length);
-     evbuffer_remove(in,ptcpdata,length);
-     //  pthread_info->thread_pool_->enqueue(*pthread_info->thread_pool_method_,(void *)ptcpdata);
-     pthread_info->thread_pool_->enqueue(*(pthread_info->thread_pool_method_),(void *)ptcpdata,length);
+    unsigned int sessionid=*(static_cast<unsigned int *>(ctx));
+    // std::shared_ptr<TcpConnItem> ptci=std::shared_ptr<TcpConnItem>(ctx);
+    std::shared_ptr<TcpConnItem> ptci=pthread_info->FindTcpConnItem(sessionid);
+        struct evbuffer * in=bufferevent_get_input(bev);
+        struct evbuffer * out=bufferevent_get_output(bev);
+
+        unsigned char ch[10]={0};
+        unsigned short len=0;
+        if(ptci->packettype!=TCPTERMINAL){
+            if(ptci->HasRemaining())
+                {
+                        if(!ptci->AllocateCopyData(in)){
+                                LOG(WARNING)<<"AllocateCopyData failed";
+                                ptci->FreeData();
+                        }
+
+                        //has received an complete packet
+                        if(!ptci->HasRemaining()){
+                            TcpConnItemData data(ptci,ptci->data,ptci->totallength);
+                            ptci->ReleaseDataOwnership();//释放所有权
+                            std::shared_ptr<ThreadPoolMethod> method=pthread_info->ls_->map_thread_pool_method_["dxpupload"];
+                            (*method)(data);
+                        }
+                }
+                else{
+                        if(evbuffer_copyout(in,ch,4)!=-1)
+                        {
+                                if(ch[0]==0x55){//DXP PROTOCOL
+                                        uint8_t lsb=ch[2];
+                                        uint8_t msb=0;
+                                        if(lsb&0x01)
+                                                msb=ch[3];
+
+                                        lsb=lsb>>1;
+                                        unsigned short len=lsb+msb*128;
+                                        if(len>127)
+                                                len+=4;
+                                        else
+                                                len+=3;
+
+                                        len=lsb+msb*128;
+
+                                        unsigned short occupied=0;
+
+                                        if(len>127)
+                                                len+=4;
+                                        else
+                                                len+=3;
+
+                                        // ptci->SetProtocol(DXP);
+                                }
+                                else{//other protocols
+                                        // ptci->SetProtocol(UNKNOWN);
+                                }
+
+                                if(!ptci->AllocateCopyData(in,len)){
+                                        LOG(WARNING)<<"AllocateCopyData failed";
+                                        ptci->FreeData();
+                                }
+
+                        }else{
+                                LOG(WARNING)<<"Get the protocol name failed";
+                                evbuffer_drain(in,65535);//clear the buffer
+                        }
+
+                }
+        }
+        else{//HANDLE CMD
+
+        }
+
+
 }
 
 void WorkerThread::TcpConnEventCB(bufferevent *bev,short int  events,void * ctx){
@@ -156,7 +218,7 @@ void WorkerThread::TcpConnEventCB(bufferevent *bev,short int  events,void * ctx)
     TcpConnItem* ptci=static_cast<TcpConnItem *>(ctx);
     //ThreadInfo * pti=static_cast<ThreadInfo *>(pthread_info);
     //when comes an error,delete the item in the cache
-    pthread_info->DeleteTcpConnItem(ptci->tcp_sock_);
+    pthread_info->DeleteTcpConnItem(ptci->sessionid);
     bufferevent_free(bev);
 }
 
@@ -221,4 +283,32 @@ void WorkerThread::UdpConnEventCB(evutil_socket_t fd, short what, void * arg){
 void WorkerThread::TimingProcessing(evutil_socket_t fd, short what, void * arg){
     //TODO
     // LOG(TRACE)<<"Timing Processing";
+}
+
+
+void WorkerThread::SendDataToClient(WorkerThread * pwt)
+{
+        if(pwt)
+        {
+                TcpConnItemData data=pwt->PopResultFromQueue();
+                if(std::shared_ptr<TcpConnItem> ptr=data.tcpconnitemptr.lock()){//here seems don't need session id;
+                        if(bufferevent_write(ptr->bev,data.data,data.length)==-1)
+                        {
+
+                        }
+                }
+                else{
+
+                }
+                nedalloc::nedfree(data.data);//释放资源，但data要由nedmalloc分配
+        }
+}
+
+void WorkerThread::KillTcpConnection(WorkerThread * pwt)
+{
+        if(pwt)
+        {
+                unsigned int sessionid=pwt->PopKillFromQueue();
+                pwt->CloseTcpConn(sessionid);
+        }
 }

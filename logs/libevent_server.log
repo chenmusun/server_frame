@@ -1,0 +1,4 @@
+2016-08-16 10:57:14 INFO  LibeventServer  starts with 12 threads and tcp listen on port 5678udp listen on port 1234 and the overtime check starts every 2 And the threshold is 200
+2016-08-16 10:57:14 INFO  the thread pool has 10 workers
+2016-08-16 10:58:43 FATAL CRASH HANDLED; Application has crashed due to [SIGINT] signal
+2016-08-16 10:58:43 WARN  Aborting application. Reason: Fatal log at [easylogging++.h:5583]
